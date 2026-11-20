@@ -1,5 +1,5 @@
 # /// script
-# requires-python = ">=3.11"
+# requires-python = "==3.13.*"  # must match the endpoint workers' Python
 # dependencies = [
 #     "academy-py",
 #     "globus-compute-sdk",
@@ -47,7 +47,7 @@ Usage:
     uv run tomo_agent.py --endpoint <MEP_UUID> \
         --user-endpoint-config '{"account": "MyProject", "queue": "debug",
                                  "walltime": "00:30:00",
-                                 "worker_init": "source ~/tomo-venv/bin/activate; export HTTPS_PROXY=http://proxy.alcf.anl.gov:3128 https_proxy=http://proxy.alcf.anl.gov:3128"}'
+                                 "worker_init": "source ~/src/Academy/recon-agent-venv/bin/activate; export HTTPS_PROXY=http://proxy.alcf.anl.gov:3128 https_proxy=http://proxy.alcf.anl.gov:3128"}'
 
     (ALCF compute nodes need the proxy to reach the hosted Academy exchange.
     The exact template keys depend on how the MEP's template is written.)
@@ -109,9 +109,16 @@ class Notifier(Agent):
 # TomoAgent: runs remotely, on the HPC resource.
 # --------------------------------------------------------------------------- #
 class TomoAgent(Agent):
-    """Runs a tomographic reconstruction and reports on it while it runs."""
+    """Runs a tomographic reconstruction and reports on it while it runs.
+
+    Note: this class is defined in the script, so Globus Compute ships it to
+    the remote machine *as code*, without the script's top-level imports.
+    That's why every method imports the modules it uses.
+    """
 
     def __init__(self, notifier: Handle[Notifier], workdir: str | None = None):
+        import threading
+
         super().__init__()
         self.notifier = notifier
         self.workdir = workdir
@@ -122,6 +129,11 @@ class TomoAgent(Agent):
     # -- lifecycle ----------------------------------------------------------
     async def agent_on_startup(self) -> None:
         # Runs on the remote machine as soon as the agent is up.
+        import os
+        import pathlib
+        import socket
+        import tempfile
+
         base = pathlib.Path(self.workdir or tempfile.gettempdir())
         base.mkdir(parents=True, exist_ok=True)
         self.log_path = base / f'tomo-{self.agent_id.uid}.log'
@@ -130,6 +142,9 @@ class TomoAgent(Agent):
             {
                 'agent_id': str(self.agent_id),
                 'hostname': socket.gethostname(),
+                # Set by PBS inside batch jobs (e.g. on ALCF machines);
+                # None if the agent isn't running under PBS.
+                'pbs_job_id': os.environ.get('PBS_JOBID'),
                 'pid': os.getpid(),
                 'cpus': os.cpu_count(),
                 'log': str(self.log_path),
@@ -140,6 +155,8 @@ class TomoAgent(Agent):
     @action
     async def get_hostname(self) -> str:
         """Hostname of the machine the agent is executing on."""
+        import socket
+
         return socket.gethostname()
 
     @action
@@ -155,6 +172,8 @@ class TomoAgent(Agent):
         that want to keep interacting with the agent should run this as a
         background task (see ``main``).
         """
+        import time
+
         if self._running:
             raise RuntimeError('A reconstruction is already running')
         self._running = True
@@ -174,6 +193,8 @@ class TomoAgent(Agent):
     @action
     async def get_progress(self) -> dict[str, Any]:
         """Report reconstruction progress by parsing the reconstruction log."""
+        import re
+
         if self.log_path is None or not self.log_path.exists():
             return {'state': 'idle', 'done': 0, 'total': 0, 'percent': 0.0}
         lines = self.log_path.read_text().splitlines()
@@ -201,6 +222,9 @@ class TomoAgent(Agent):
     @action
     async def get_utilization(self) -> dict[str, Any]:
         """Snapshot of CPU, memory and load on the agent's machine."""
+        import os
+        import socket
+
         import psutil
 
         vm = psutil.virtual_memory()
@@ -232,6 +256,9 @@ class TomoAgent(Agent):
         matter for the demo are writing progress to the log and checking
         ``self._cancel`` between units of work.
         """
+        import socket
+        import time
+
         import numpy as np
         from skimage.data import shepp_logan_phantom
         from skimage.transform import iradon
@@ -317,8 +344,22 @@ async def main(args: argparse.Namespace) -> None:
         )
         print('Submitted TomoAgent, waiting for it to start '
               '(on a batch-scheduled MEP this can take a while)...')
-        info = await notifier.wait_started(timeout=args.start_timeout)
-        print(f'Agent is running on {await tomo.get_hostname()}')
+        # Wait for the startup notification, but stop early if the agent
+        # dies first (e.g. a missing package on the remote machine).
+        started = asyncio.create_task(
+            notifier.wait_started(timeout=args.start_timeout),
+        )
+        died = asyncio.create_task(manager.wait([tomo], raise_error=True))
+        await asyncio.wait({started, died},
+                           return_when=asyncio.FIRST_COMPLETED)
+        if not started.done():
+            started.cancel()
+            died.result()  # re-raises the remote error
+            raise RuntimeError('TomoAgent exited before it started')
+        died.cancel()
+        info = started.result()
+        print(f'Agent is running on {await tomo.get_hostname()} '
+              f'(PBS job: {info["pbs_job_id"] or "n/a"})')
 
         # Start the reconstruction in the background, so we can keep talking
         # to the agent while it runs.

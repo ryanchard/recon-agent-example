@@ -54,17 +54,17 @@ The `Manager` is given a Globus Compute `Executor`. `manager.launch(TomoAgent, e
 
 **On the Globus Compute endpoint's workers:**
 
-- The **same Python minor version** as your laptop (e.g. both 3.12). The agent classes are defined in the script itself, so they are serialized as code, and that doesn't work across Python versions.
+- The **same Python minor version** as your laptop. The agent classes are defined in the script itself, so they are serialized as code, and that doesn't work across Python versions.
+- **On a multi-user endpoint, the same Python *and* `globus-compute-endpoint` version as the endpoint itself.** The workers started from your environment must match the endpoint's task-dispatch process exactly (Python version and the Parsl version that `globus-compute-endpoint` pins), or every task fails with `Manager version info ... does not match interchange version info`. You can look up the endpoint's versions with `Client().get_endpoint_metadata(ENDPOINT_ID)` (`python_version`, `endpoint_version`).
 - `academy-py` (ideally the same version as your laptop), `numpy`, `scikit-image`, `psutil`.
-- Outbound HTTPS to `exchange.academy-agents.org`. At ALCF, compute nodes need the proxy for this:
-  `export HTTPS_PROXY=http://proxy.alcf.anl.gov:3128 https_proxy=http://proxy.alcf.anl.gov:3128`
+- Outbound HTTPS to `exchange.academy-agents.org`. At ALCF, compute nodes use `proxy.alcf.anl.gov:3128` for this. On Polaris `http(s)_proxy` is already set in jobs, but exporting it in `worker_init` does no harm.
 
-A simple way to set up the worker environment on the HPC system:
+For the Polaris multi-user endpoint `9a947ba5-f537-4681-acf3-cc66485aadec` (Python 3.13, Globus Compute 4.9.0), set up the worker environment on a login node with:
 
 ```bash
-uv venv ~/tomo-venv --python 3.12        # match your laptop's Python
-source ~/tomo-venv/bin/activate
-uv pip install academy-py numpy scikit-image psutil globus-compute-endpoint
+uv venv ~/src/Academy/recon-agent-venv --python 3.13 --managed-python  # tomo_agent.py is pinned to 3.13
+source ~/src/Academy/recon-agent-venv/bin/activate
+uv pip install academy-py==1.0.0 globus-compute-endpoint==4.9.0 numpy scikit-image psutil
 ```
 
 ## Running it
@@ -94,20 +94,26 @@ uv run tomo_agent.py --endpoint <ENDPOINT_UUID>
 
 The first run opens a Globus login for the hosted Academy exchange (and for Globus Compute, if you haven't logged in before).
 
-### 3. On a multi-user endpoint (e.g. ALCF)
+### 3. On a multi-user endpoint (e.g. ALCF Polaris)
 
-Multi-user endpoints take a per-user config, typically a PBS account, queue, walltime and a `worker_init` that prepares the environment. The exact keys depend on how the endpoint's template is written; ask the endpoint admin or check its documentation.
+Multi-user endpoints take a per-user config, typically a PBS account, queue, walltime and a `worker_init` that prepares the environment. The keys come from the endpoint's template; `Client().get_endpoint_metadata(ENDPOINT_ID)["user_config_schema"]` lists them.
+
+This is the command tested on the Polaris multi-user endpoint (`account` and `queue` are required there):
 
 ```bash
-uv run tomo_agent.py --endpoint <MEP_UUID> --user-endpoint-config '{
-  "account": "MyProject",
+uv run tomo_agent.py --endpoint 9a947ba5-f537-4681-acf3-cc66485aadec --user-endpoint-config '{
+  "account": "APSDataAnalysis",
   "queue": "debug",
   "walltime": "00:30:00",
-  "worker_init": "source ~/tomo-venv/bin/activate; export HTTPS_PROXY=http://proxy.alcf.anl.gov:3128 https_proxy=http://proxy.alcf.anl.gov:3128"
+  "worker_init": "source ~/src/Academy/recon-agent-venv/bin/activate"
 }'
 ```
 
-The "agent started" notification only arrives once the batch job is scheduled, so this can take a while. `--start-timeout` (default 1800 s) controls how long the script waits.
+Things to know:
+
+- The "agent started" notification only arrives once the PBS job starts, so the first run can sit in the queue for a while (about 25 minutes in testing on the `debug` queue). `--start-timeout` (default 1800 s) controls how long the script waits. If the agent crashes on startup, the script exits immediately with the remote error.
+- The endpoint keeps the PBS job for about 4 minutes after it goes idle. A second run with the **identical** `--user-endpoint-config` reuses the same node and starts in seconds; any change to the config starts a new job.
+- The agent writes to the node-local `/tmp` by default, which is wiped when the job ends. Pass `--workdir` with a path on a shared filesystem (e.g. under your home directory) to keep the log and output.
 
 ### Options
 
@@ -116,29 +122,34 @@ The "agent started" notification only arrives once the batch job is scheduled, s
 | `--local` / `--endpoint UUID` | (one required) | Run in-process, or on a Globus Compute endpoint |
 | `--user-endpoint-config JSON` | none | Per-user config for a multi-user endpoint |
 | `--workdir DIR` | remote temp dir | Where the log and output `.npy` are written on the remote machine |
-| `--slices` / `--size` / `--angles` | 128 / 512 / 360 | Size of the reconstruction (about 90 s single-threaded on a laptop) |
+| `--slices` / `--size` / `--angles` | 128 / 512 / 360 | Size of the reconstruction (about 90 s on a laptop, 210 s on a Polaris node; single-threaded) |
 | `--poll SECONDS` | 3 | Time between progress/utilization checks |
 | `--cancel-after SECONDS` | none | Cancel the reconstruction after this long, to demo cancellation |
 | `--start-timeout SECONDS` | 1800 | How long to wait for the agent to report it started |
 
 ## Example output
 
+From the Polaris multi-user endpoint, with `--cancel-after 30`:
+
 ```
 Submitted TomoAgent, waiting for it to start (on a batch-scheduled MEP this can take a while)...
 
-🔔  [agent-started] {"agent_id": "AgentId<a2513a14>", "hostname": "x4000c0s0b0n0", "pid": 15748, "cpus": 208, "log": "/tmp/tomo-a2513a14-....log"}
+🔔  [agent-started] {"agent_id": "AgentId<7fbabdc8>", "hostname": "x3001c0s19b0n0", "pbs_job_id": "7869140.polaris-pbs-01.hsn.cm.polaris.alcf.anl.gov", "pid": 2276953, "cpus": 64, "log": "/tmp/tomo-7fbabdc8-5e0e-4f29-9fe4-bce3bdd9427f.log"}
 
-Agent is running on x4000c0s0b0n0
-[   0.5s] preparing    0/0    (  0.0%) | cpu   0.0%  load  0.42  mem  3.8%  @ x4000c0s0b0n0
-[   3.0s]   running    3/128  (  2.3%) | cpu  11.6%  load  0.42  mem  4.1%  @ x4000c0s0b0n0
+Agent is running on x3001c0s19b0n0 (PBS job: 7869140.polaris-pbs-01.hsn.cm.polaris.alcf.anl.gov)
+[   0.6s]      idle    0/0    (  0.0%) | cpu   0.0%  load  0.81  mem  3.3%  @ x3001c0s19b0n0
+[   6.1s]   running    2/128  (  1.6%) | cpu   1.6%  load  0.83  mem  3.4%  @ x3001c0s19b0n0
+[  12.1s]   running    6/128  (  4.7%) | cpu   1.6%  load  0.84  mem  3.4%  @ x3001c0s19b0n0
 ...
-[  15.6s]   running   20/128  ( 15.6%) | cpu   9.9%  load  0.95  mem  3.7%  @ x4000c0s0b0n0
+[  34.3s]   running   19/128  ( 14.8%) | cpu   1.6%  load  0.90  mem  3.3%  @ x3001c0s19b0n0
 Cancelling reconstruction...
 
-🔔  [reconstruction-done] {"state": "cancelled", "slices_done": 21, "elapsed_s": 15.4}
+🔔  [reconstruction-done] {"state": "cancelled", "slices_done": 21, "elapsed_s": 34.2}
+
+Log on remote machine: /tmp/tomo-7fbabdc8-5e0e-4f29-9fe4-bce3bdd9427f.log
 ```
 
-(The hostnames above are illustrative; the cancel sequence was captured from a local run.)
+Without `--cancel-after`, the full 128-slice reconstruction took 209 s on a Polaris node. CPU shows about 1.6% because the example reconstruction uses one of the node's 64 cores.
 
 ## Using it from your own code
 
@@ -159,6 +170,7 @@ To use real data, replace the body of `TomoAgent._reconstruct_blocking` (for exa
 
 ## Caveats
 
+- **Import inside the agent's methods.** Because `TomoAgent` is defined in the script, Globus Compute sends it to the remote machine as code, but the script's top-level imports don't go with it. A method that uses a module imported only at the top of the file fails remotely with `NameError` (while working fine with `--local`). That's why every `TomoAgent` method has its own imports. Moving the agent into an installed module, imported on both sides, also avoids this.
 - **The agent occupies a Globus Compute worker for its whole lifetime.** On a batch-scheduled endpoint that means a job, so walltime limits how long the agent can live.
 - **Cancellation is cooperative.** Python threads can't be killed, so cancel takes effect between slices. If the reconstruction is an external program, run it with `asyncio.create_subprocess_exec` and have `cancel()` call `proc.terminate()`.
 - **Authentication.** `HttpExchangeFactory(auth_method='globus')` includes your Globus access token in the exchange settings sent to the remote agent, so the agent talks to the exchange as you. That's fine for a demo. For per-agent identities, see Academy's `GlobusExchangeFactory` (`examples/12-globus-exchange` in the Academy repo).
